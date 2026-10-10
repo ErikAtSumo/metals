@@ -93,12 +93,21 @@ object MbtWorkspaceSymbolProvider {
 
   private val AbstractModifier = "\\babstract\\b".r
 
+  private def frameworkPackage(symbol: String): String =
+    Symbol(symbol).owner.value.stripSuffix("/").replace('/', '.')
+
+  /** Packages of test framework base classes, e.g. `org.scalatest.wordspec`. */
+  private lazy val FrameworkPackages: Set[String] =
+    TestFrameworkSymbolRegistry.baseParentSymbols.map(frameworkPackage).toSet
+
   /** A top-level type as parsed by the toplevel indexer. */
   private case class DeclaredType(
       symbol: String,
       isObject: Boolean,
       parentNames: List[String],
       isAbstract: Boolean,
+      // Framework packages mentioned anywhere in the declaring file.
+      frameworkPackages: Set[String],
   )
 
   private case class ParsedFile(types: List[DeclaredType])
@@ -900,6 +909,8 @@ class MbtWorkspaceSymbolProvider(
               .findFirstIn(lines(range.startLine).take(range.startCharacter))
               .isDefined
           }
+      val mentionedFrameworkPackages =
+        FrameworkPackages.filter(doc.text.contains)
       val types = for {
         info <- doc.symbols.toList
         if isTypeKind(info.kind) && Symbol(info.symbol).isToplevel
@@ -908,6 +919,7 @@ class MbtWorkspaceSymbolProvider(
         info.kind.isObject,
         parentsByOwner.getOrElse(info.symbol, Nil),
         isAbstract(info),
+        mentionedFrameworkPackages,
       )
       Some(ParsedFile(types))
     } catch {
@@ -936,7 +948,8 @@ class MbtWorkspaceSymbolProvider(
    * left for semanticdb to confirm when that's not conclusive: a parent name
    * is also declared by a workspace type the search didn't reach, its
    * declarations disagree, it names both a framework base and a workspace
-   * type, or it leads to a type in an annotation hit with no framework parent,
+   * type, it names a framework base whose package the file doesn't mention,
+   * or it leads to a type in an annotation hit with no framework parent,
    * which may be a test through annotations. Classes in annotation hits with
    * no framework parent are left for semanticdb for the same reason.
    */
@@ -947,11 +960,8 @@ class MbtWorkspaceSymbolProvider(
     val frameworksByName = (for {
       symbol <- baseParentSymbols
       framework <- TestFrameworkSymbolRegistry.frameworkForSymbol(symbol)
-    } yield Symbol(symbol).displayName -> framework)
+    } yield Symbol(symbol).displayName -> (framework, frameworkPackage(symbol)))
       .groupMap(_._1)(_._2)
-      .view
-      .mapValues(_.distinct)
-      .toMap
     val typesByName = (for {
       (path, parsed) <- search.parsedFiles.toSeq
       tpe <- parsed.toList.flatMap(_.types)
@@ -985,26 +995,39 @@ class MbtWorkspaceSymbolProvider(
         case None if visiting(name) => NoFramework
         case None =>
           val declarations = typesByName.getOrElse(name, Nil)
-          val resolution = frameworksByName.get(name) match {
-            case Some(Seq(framework)) if declarations.isEmpty =>
-              Found(framework)
-            case Some(_) => Unknown
-            case None if declarations.size < indexedCounts.getOrElse(name, 0) =>
-              Unknown
-            case None =>
+          val resolution =
+            if (declarations.size < indexedCounts.getOrElse(name, 0)) Unknown
+            else
               combine(declarations.map { case (tpe, isAnnotationHit) =>
                 resolveType(tpe, isAnnotationHit, visiting + name)
               })
-          }
           resolvedNames(name) = resolution
           resolution
+      }
+    // A framework base name only counts in files that mention its package,
+    // e.g. `this: Suite =>` with `org.scalatest.Suite` isn't `munit.Suite`.
+    def resolveParent(
+        name: String,
+        tpe: DeclaredType,
+        visiting: Set[String],
+    ): Resolution =
+      frameworksByName.get(name) match {
+        case None => resolveName(name, visiting)
+        case Some(frameworks) =>
+          frameworks.collect {
+            case (framework, pkg) if tpe.frameworkPackages(pkg) => framework
+          }.distinct match {
+            case Seq(framework) if !typesByName.contains(name) =>
+              Found(framework)
+            case _ => Unknown
+          }
       }
     def resolveType(
         tpe: DeclaredType,
         isAnnotationHit: Boolean,
         visiting: Set[String],
     ): Resolution =
-      combine(tpe.parentNames.map(resolveName(_, visiting))) match {
+      combine(tpe.parentNames.map(resolveParent(_, tpe, visiting))) match {
         case NoFramework if isAnnotationHit => Unknown
         case resolution => resolution
       }
