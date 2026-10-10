@@ -391,6 +391,47 @@ message Dependency {}
     )
   }
 
+  test("candidate-test-classes-annotation-name-hit") {
+    FileLayout.fromString(
+      """|/example/AccountType.scala
+         |package example
+         |object AccountType {
+         |  val Test = "test"
+         |}
+         |/example/AccountTest.scala
+         |package example
+         |class AccountTest extends munit.FunSuite {
+         |  test("type") { assert(AccountType.Test.nonEmpty) }
+         |}
+         |/example/Helper.scala
+         |package example
+         |class Helper {
+         |  val accountType = AccountType.Test
+         |}
+         |""".stripMargin,
+      root = workspace(),
+    )
+    val provider = newProvider()
+    workspace.executeCommand("git init -b main")
+    workspace.gitCommitAllChanges()
+    provider.onReindex().awaitBackgroundJobs()
+    val candidates = provider.candidateTestClasses(
+      _ => true,
+      TestFrameworkSymbolRegistry.annotationSymbols,
+      TestFrameworkSymbolRegistry.baseParentSymbols,
+    )
+    // Mentioning `Test` matches the JUnit annotation search, but the parents
+    // still resolve. The others may be JUnit tests, so semanticdb decides.
+    assertEquals(
+      candidates.map(c => c.candidateSymbol -> c.framework).toSet,
+      Set[(String, Option[TestFramework])](
+        "example/AccountTest#" -> Some(TestFramework.munit),
+        "example/AccountType." -> None,
+        "example/Helper#" -> None,
+      ),
+    )
+  }
+
   test("candidate-test-classes-ambiguous-parent-name") {
     FileLayout.fromString(
       """|/example/Base.scala

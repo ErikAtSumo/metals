@@ -105,7 +105,8 @@ object MbtWorkspaceSymbolProvider {
 
   private case class TestFileSearch(
       annotationFiles: Set[AbsolutePath],
-      subtypeFiles: Map[AbsolutePath, Option[ParsedFile]],
+      // All matched files, None for Java annotation hits and unparseable files.
+      parsedFiles: Map[AbsolutePath, Option[ParsedFile]],
   )
 
   /** What a type's parents say about it being a test suite. */
@@ -815,7 +816,7 @@ class MbtWorkspaceSymbolProvider(
       implementations: Seq[String],
   ): TestFileSearch = {
     val allMatchedPaths = scala.collection.mutable.HashSet.empty[AbsolutePath]
-    val subtypes =
+    val parsedFiles =
       scala.collection.mutable.HashMap.empty[AbsolutePath, Option[ParsedFile]]
     val annotationFiles =
       if (references.isEmpty) Set.empty[AbsolutePath]
@@ -824,6 +825,11 @@ class MbtWorkspaceSymbolProvider(
           MbtPossibleReferencesParams(references = references)
         )
     allMatchedPaths ++= annotationFiles
+    // Java annotation hits are confirmed with Turbine, so only parse Scala.
+    parsedFiles ++= ParArray
+      .fromSpecific(annotationFiles)
+      .map(path => path -> Option.when(!path.isJava)(path).flatMap(parseFile))
+      .seq
 
     val initialImplementations =
       implementations ++ annotationFiles.flatMap(bfsSeedSymbols)
@@ -833,14 +839,14 @@ class MbtWorkspaceSymbolProvider(
 
     while (frontier.nonEmpty) {
       allMatchedPaths ++= frontier.keys
-      subtypes ++= frontier
+      parsedFiles ++= frontier
       val nextBaseSymbols = frontier.keys.flatMap(bfsSeedSymbols).toSeq
       frontier =
         if (nextBaseSymbols.isEmpty) Map.empty
         else subtypeFiles(nextBaseSymbols) -- allMatchedPaths
     }
 
-    TestFileSearch(annotationFiles, subtypes.toMap)
+    TestFileSearch(annotationFiles, parsedFiles.toMap)
   }
 
   /**
@@ -921,21 +927,23 @@ class MbtWorkspaceSymbolProvider(
     kind.isClass || kind.isTrait || kind.isInterface || kind.isObject
 
   /**
-   * Test frameworks of the concrete top-level Scala classes and objects in
-   * files found by the inheritance search, resolved by following parent names
-   * through the parsed types up to a framework base class. This avoids
-   * typechecking every candidate just to learn what it extends.
+   * Test class candidates for the concrete top-level classes and objects of
+   * the parsed Scala files, resolved by following parent names through the
+   * parsed types up to a framework base class. This avoids typechecking every
+   * candidate just to learn what it extends.
    *
-   * A file maps to None when that's not conclusive: a parent name is also
-   * declared by a workspace type the search didn't reach, its declarations
-   * disagree, it names both a framework base and a workspace type, or it leads
-   * to a type that's only a test through annotations. Those files are still
-   * confirmed with semanticdb.
+   * A class gets a framework when its parents resolve to exactly one. It's
+   * left for semanticdb to confirm when that's not conclusive: a parent name
+   * is also declared by a workspace type the search didn't reach, its
+   * declarations disagree, it names both a framework base and a workspace
+   * type, or it leads to a type in an annotation hit with no framework parent,
+   * which may be a test through annotations. Classes in annotation hits with
+   * no framework parent are left for semanticdb for the same reason.
    */
   private def syntacticTestClasses(
       search: TestFileSearch,
       baseParentSymbols: Seq[String],
-  ): Map[AbsolutePath, Option[Map[String, TestFramework]]] = {
+  ): Map[AbsolutePath, Seq[BuildTargetClasses.TestClassCandidate]] = {
     val frameworksByName = (for {
       symbol <- baseParentSymbols
       framework <- TestFrameworkSymbolRegistry.frameworkForSymbol(symbol)
@@ -945,11 +953,14 @@ class MbtWorkspaceSymbolProvider(
       .mapValues(_.distinct)
       .toMap
     val typesByName = (for {
-      parsed <- search.subtypeFiles.values.flatten
-      tpe <- parsed.types
-    } yield Symbol(tpe.symbol).displayName -> tpe).groupMap(_._1)(_._2)
-    val annotationNames =
-      search.annotationFiles.flatMap(bfsSeedSymbols).map(Symbol(_).displayName)
+      (path, parsed) <- search.parsedFiles.toSeq
+      tpe <- parsed.toList.flatMap(_.types)
+    } yield Symbol(tpe.symbol).displayName -> (
+      tpe,
+      search.annotationFiles(
+        path
+      ),
+    )).groupMap(_._1)(_._2)
     // Types with a parsed name that the search didn't reach make it ambiguous.
     val indexedCounts = documentsKeys
       .flatMap { path =>
@@ -978,29 +989,45 @@ class MbtWorkspaceSymbolProvider(
             case Some(Seq(framework)) if declarations.isEmpty =>
               Found(framework)
             case Some(_) => Unknown
-            case None if annotationNames(name) => Unknown
             case None if declarations.size < indexedCounts.getOrElse(name, 0) =>
               Unknown
             case None =>
-              combine(declarations.map(resolveParents(_, visiting + name)))
+              combine(declarations.map { case (tpe, isAnnotationHit) =>
+                resolveType(tpe, isAnnotationHit, visiting + name)
+              })
           }
           resolvedNames(name) = resolution
           resolution
       }
-    def resolveParents(tpe: DeclaredType, visiting: Set[String]): Resolution =
-      combine(tpe.parentNames.map(resolveName(_, visiting)))
+    def resolveType(
+        tpe: DeclaredType,
+        isAnnotationHit: Boolean,
+        visiting: Set[String],
+    ): Resolution =
+      combine(tpe.parentNames.map(resolveName(_, visiting))) match {
+        case NoFramework if isAnnotationHit => Unknown
+        case resolution => resolution
+      }
 
-    search.subtypeFiles.map {
-      case (path, Some(parsed)) if !path.isJava =>
-        val resolved =
-          parsed.types.map(tpe => tpe -> resolveParents(tpe, Set.empty))
-        val testClasses = resolved.collect {
-          case (tpe, Found(framework)) if tpe.isObject || !tpe.isAbstract =>
-            tpe.symbol -> framework
-        }
-        path -> Option
-          .when(!resolved.exists(_._2 == Unknown))(testClasses.toMap)
-      case (path, _) => path -> None
+    for {
+      (path, Some(parsed)) <- search.parsedFiles
+      if !path.isJava
+    } yield {
+      val isAnnotationHit = search.annotationFiles(path)
+      val candidates = for {
+        tpe <- parsed.types
+        if tpe.isObject || !tpe.isAbstract
+        resolution = resolveType(tpe, isAnnotationHit, Set.empty)
+        if resolution != NoFramework
+      } yield BuildTargetClasses.TestClassCandidate(
+        path,
+        tpe.symbol,
+        resolution match {
+          case Found(framework) => Some(framework)
+          case _ => None
+        },
+      )
+      path -> candidates
     }
   }
 
@@ -1112,17 +1139,10 @@ class MbtWorkspaceSymbolProvider(
     val resolved = syntacticTestClasses(search, baseParentSymbols)
 
     for {
-      path <- search.annotationFiles ++ search.subtypeFiles.keySet
+      path <- search.parsedFiles.keys
       if filterPath(path)
-    } resolved.get(path).flatten match {
-      case Some(testClasses) =>
-        for ((symbol, framework) <- testClasses) {
-          candidates += BuildTargetClasses.TestClassCandidate(
-            path,
-            symbol,
-            Some(framework),
-          )
-        }
+    } resolved.get(path) match {
+      case Some(fileCandidates) => candidates ++= fileCandidates
       case None =>
         // Add all class/object symbols as candidates to confirm with semanticdb
         for {
