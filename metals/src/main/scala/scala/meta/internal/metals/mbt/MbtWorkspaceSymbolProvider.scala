@@ -1031,10 +1031,16 @@ class MbtWorkspaceSymbolProvider(
     }
   }
 
+  /**
+   * A framework found through one parent decides, even if other parents are
+   * inconclusive: the class is a test either way, and like semanticdb
+   * confirmation, discovery reports a single framework per class.
+   */
   private def combine(resolutions: Iterable[Resolution]): Resolution = {
     val found = resolutions.collect { case found: Found => found }.toSet
-    if (resolutions.exists(_ == Unknown) || found.size > 1) Unknown
-    else found.headOption.getOrElse(NoFramework)
+    if (found.size == 1) found.head
+    else if (found.nonEmpty || resolutions.exists(_ == Unknown)) Unknown
+    else NoFramework
   }
 
   private def bfsSeedSymbols(

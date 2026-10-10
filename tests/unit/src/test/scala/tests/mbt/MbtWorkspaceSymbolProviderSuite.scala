@@ -443,6 +443,7 @@ message Dependency {}
          |/example/FooTest.scala
          |package example
          |class FooTest extends Base
+         |class BarTest extends munit.FunSuite with Base
          |""".stripMargin,
       root = workspace(),
     )
@@ -455,10 +456,14 @@ message Dependency {}
       TestFrameworkSymbolRegistry.annotationSymbols,
       TestFrameworkSymbolRegistry.baseParentSymbols,
     )
-    // `other.Base` wasn't reached by the search, so semanticdb decides
+    // `other.Base` wasn't reached by the search, so semanticdb decides for
+    // FooTest. BarTest is a munit suite whichever `Base` it extends.
     assertEquals(
       candidates.map(c => c.candidateSymbol -> c.framework).toSet,
-      Set[(String, Option[TestFramework])]("example/FooTest#" -> None),
+      Set[(String, Option[TestFramework])](
+        "example/FooTest#" -> None,
+        "example/BarTest#" -> Some(TestFramework.munit),
+      ),
     )
   }
 
